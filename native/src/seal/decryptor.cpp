@@ -105,7 +105,7 @@ namespace seal
         
         ConstRNSIter c0(encrypted.data(0), coeff_count);
         if (!is_ntt_form){
-        for (int i = 0; i <3; ++i) {
+        for (int i = 0; i <party_num; ++i) {
             auto &context_data_ = *context_.get_context_data(partialDecryption[i].parms_id());
             auto ntt_tables = context_data_.small_ntt_tables();
 

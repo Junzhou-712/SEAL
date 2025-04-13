@@ -114,5 +114,16 @@ namespace seal
         void encrypt_zero_symmetric_with_c1(
             const SecretKey &secret_key, const SEALContext &context, parms_id_type parms_id, bool is_ntt_form,
             bool save_seed, Ciphertext &ref,Ciphertext &destination);
+
+        void encrypt_zero_symmetric_crp_round_one(
+            const SecretKey &secret_key, const SEALContext &context, util::Pointer<uint64_t> &u, parms_id_type parms_id, 
+            bool is_ntt_form, bool save_seed, Ciphertext &destination);
+
+        void encrypt_zero_symmetric_with_sk_round_two(const SecretKey &secret_key, const SEALContext &context, parms_id_type parms_id, bool is_ntt_form,
+            bool save_seed,Ciphertext &destination);
+
+        void encrypt_zero_symmetric_with_round_one_two(
+                Ciphertext &round_one, const SEALContext &context, parms_id_type parms_id, bool is_ntt_form, bool save_seed,
+                Ciphertext &round_two, Ciphertext &destination);
     } // namespace util
 } // namespace seal

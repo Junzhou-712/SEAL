@@ -29,6 +29,23 @@ namespace seal
         // Secret key has not been generated
         sk_generated_ = false;
 
+        prng_seed_type crs_seed{};
+        crs_seed.fill(0ULL);
+
+        auto crs_prng = UniformRandomGeneratorFactory::DefaultFactory()->create(crs_seed);
+
+        auto &context_data = *context.key_context_data();
+        auto &parms = context_data.parms();
+        auto &coeff_modulus = parms.coeff_modulus();
+        auto &plain_modulus = parms.plain_modulus();
+        size_t coeff_modulus_size = coeff_modulus.size();
+        size_t coeff_count = parms.poly_modulus_degree();
+
+        u_ = allocate_poly(coeff_count, coeff_modulus_size, pool_);
+        // Sample the NTT form directly
+        sample_poly_uniform(crs_prng, parms, u_.get());
+    
+
         // Generate the secret and public key
         generate_sk();
     }
@@ -233,9 +250,10 @@ namespace seal
 
         // Secret key has been generated
         sk_generated_ = true;
-    return CSK;
+        return CSK;
         
     }
+
     PublicKey KeyGenerator::generate_cpk(vector<PublicKey> &pks, int party_num)
     {
         // Extract encryption parameters.
@@ -374,36 +392,16 @@ namespace seal
         // cout<< *destination[0].data().data(1)<<endl;
         int length = rotkey.size();
         for (int i = 0; i <decomp_mod_count ; i++){
-            // auto bootstrap_prng = key_parms.random_generator()->create();
-
-            // // Sample a public seed for generating uniform randomness
-            // prng_seed_type public_prng_seed;
-            // bootstrap_prng->generate(prng_seed_byte_count, reinterpret_cast<seal_byte *>(public_prng_seed.data()));
-
-            // auto ciphertext_prng = UniformRandomGeneratorFactory::DefaultFactory()->create(public_prng_seed);
-
-            // sample_poly_uniform(ciphertext_prng, key_parms, c1);
-            //  sample_poly_uniform(ciphertext_prng, key_parms, destination[i].data().data(1));
-        // for (size_t j = 0; j < decomp_mod_count; j++){
         for (size_t j = 0; j < coeff_modulus_size; j++){
             // sample_poly_uniform(ciphertext_prng, key_parms, destination[i].data().data(1)+ j * coeff_count);
             add_poly_coeffmod(destination[i].data().data()+ j * coeff_count,rotkey[i].data().data() + j * coeff_count , coeff_count, key_modulus[j],destination[i].data().data()+ j * coeff_count);
         }
-        // add_poly_coeffmod(
-        //             destination[i].data().data(),rotkey[i].data().data()  , coeff_count, key_modulus[i],
-        //             destination[i].data().data());
-        // add_poly_coeffmod(
-        //             destination[i].data().data(),rotkey[i].data().data()  , coeff_count, key_modulus[i],
-        //             destination[i].data().data());
         }
-
-        // cout<< *destination[0].data().data(1)<<endl;
-        // cout<< *destination[0].data().data(1) <<endl;
     }
 
     GaloisKeys KeyGenerator::create_galois_keys_with_sk_c1(const vector<uint32_t> &galois_elts, bool save_seed, SecretKey &sk, GaloisKeys &ref)
     {
-                // Extract encryption parameters.
+        // Extract encryption parameters.
         auto &context_data = *context_.key_context_data();
         auto &parms = context_data.parms();
         auto &coeff_modulus = parms.coeff_modulus();
@@ -792,4 +790,369 @@ namespace seal
             this->generate_one_kswitch_key(get<0>(I), get<1>(I), save_seed);
         });
     }
+
+    void KeyGenerator::generate_kswitch_keys_round_one(
+        ConstPolyIter new_keys, size_t num_keys, KSwitchKeys &destination, bool save_seed)
+    {
+        size_t coeff_count = context_.key_context_data()->parms().poly_modulus_degree();
+        auto &key_context_data = *context_.key_context_data();
+        auto &key_parms = key_context_data.parms();
+        size_t coeff_modulus_size = key_parms.coeff_modulus().size();
+
+        // Size check
+        if (!product_fits_in(coeff_count, coeff_modulus_size, num_keys))
+        {
+            throw logic_error("invalid parameters");
+        }
+#ifdef SEAL_DEBUG
+        if (new_keys.poly_modulus_degree() != coeff_count)
+        {
+            throw invalid_argument("iterator is incompatible with encryption parameters");
+        }
+        if (new_keys.coeff_modulus_size() != coeff_modulus_size)
+        {
+            throw invalid_argument("iterator is incompatible with encryption parameters");
+        }
+#endif
+        destination.data().resize(num_keys);
+        SEAL_ITERATE(iter(new_keys, destination.data()), num_keys, [&](auto I) {
+            this->generate_one_kswitch_key_crp_round_one_with_sk(get<0>(I), get<1>(I), save_seed);
+        });
+    }
+
+    // round1 = [-u_i * a + s_i * w + e_i0, s_i* a + e_i1]
+    void KeyGenerator::generate_one_kswitch_key_crp_round_one_with_sk(ConstRNSIter new_key, vector<PublicKey> &destination, bool save_seed)
+    {
+        if (!context_.using_keyswitching())
+        {
+            throw logic_error("keyswitching is not supported by the context");
+        }
+
+        size_t coeff_count = context_.key_context_data()->parms().poly_modulus_degree();
+        size_t decomp_mod_count = context_.first_context_data()->parms().coeff_modulus().size();
+        auto &key_context_data = *context_.key_context_data();
+        auto &key_parms = key_context_data.parms();
+        auto &key_modulus = key_parms.coeff_modulus();
+        size_t coeff_modulus_size = key_modulus.size();
+        // Size check
+        if (!product_fits_in(coeff_count, decomp_mod_count))
+        {
+            throw logic_error("invalid parameters");
+        }
+
+        // KSwitchKeys data allocated from pool given by MemoryManager::GetPool.
+        destination.resize(decomp_mod_count);
+
+        SEAL_ITERATE(iter(new_key, key_modulus, destination, size_t(0)), decomp_mod_count, [&](auto I) {
+            SEAL_ALLOCATE_GET_COEFF_ITER(temp, coeff_count, pool_);
+            // destination = [-u_i * a + e_i0, s_i* a + e_i1]
+            encrypt_zero_symmetric_crp_round_one(
+                secret_key_, context_, u_, key_context_data.parms_id(), true, save_seed, get<2>(I).data());
+            // decomposition basis 
+            uint64_t factor = barrett_reduce_64(key_modulus.back().value(), get<1>(I));
+            factor *= key_modulus.back().value();
+            // temp = si * w
+            multiply_poly_scalar_coeffmod(get<0>(I), coeff_count, factor, get<1>(I), temp);
+
+            CoeffIter destination_iter = (*iter(get<2>(I).data()))[get<3>(I)];
+            add_poly_coeffmod(destination_iter, temp, coeff_count, get<1>(I), destination_iter);
+        });
+    }
+
+    // round2 = [si * h0 + e2, (ui - si) * h1 + e3]
+    void KeyGenerator::generate_one_kswitch_key_round_two_with_sk(ConstRNSIter new_key, std::vector<PublicKey> &destination, bool save_seed)
+    {
+        if (!context_.using_keyswitching())
+        {
+            throw logic_error("keyswitching is not supported by the context");
+        }
+
+        size_t coeff_count = context_.key_context_data()->parms().poly_modulus_degree();
+        size_t decomp_mod_count = context_.first_context_data()->parms().coeff_modulus().size();
+        auto &key_context_data = *context_.key_context_data();
+        auto &key_parms = key_context_data.parms();
+        auto &key_modulus = key_parms.coeff_modulus();
+        size_t coeff_modulus_size = key_modulus.size();
+        // Size check
+        if (!product_fits_in(coeff_count, decomp_mod_count))
+        {
+            throw logic_error("invalid parameters");
+        }
+
+        // KSwitchKeys data allocated from pool given by MemoryManager::GetPool.
+        destination.resize(decomp_mod_count);
+
+        SEAL_ITERATE(iter(new_key, key_modulus, destination, size_t(0)), decomp_mod_count, [&](auto I) {
+            SEAL_ALLOCATE_GET_COEFF_ITER(temp, coeff_count, pool_);
+            // destination = [si * h0 + e2 ,(ui - si) * h1 + e3]
+            encrypt_zero_symmetric_with_sk_round_two(
+                secret_key_, context_, key_context_data.parms_id(), true, save_seed, get<2>(I).data());
+        });
+    }
+
+    void KeyGenerator::generate_kswitch_keys_round_two(
+        ConstPolyIter new_keys, size_t num_keys, KSwitchKeys &destination, bool save_seed)
+    {
+        size_t coeff_count = context_.key_context_data()->parms().poly_modulus_degree();
+        auto &key_context_data = *context_.key_context_data();
+        auto &key_parms = key_context_data.parms();
+        size_t coeff_modulus_size = key_parms.coeff_modulus().size();
+
+        // Size check
+        if (!product_fits_in(coeff_count, coeff_modulus_size, num_keys))
+        {
+            throw logic_error("invalid parameters");
+        }
+#ifdef SEAL_DEBUG
+        if (new_keys.poly_modulus_degree() != coeff_count)
+        {
+            throw invalid_argument("iterator is incompatible with encryption parameters");
+        }
+        if (new_keys.coeff_modulus_size() != coeff_modulus_size)
+        {
+            throw invalid_argument("iterator is incompatible with encryption parameters");
+        }
+#endif
+        destination.data().resize(num_keys);
+        SEAL_ITERATE(iter(new_keys, destination.data()), num_keys, [&](auto I) {
+            this->generate_one_kswitch_key_round_two_with_sk(get<0>(I), get<1>(I), save_seed);
+        });
+    }
+
+    RelinKeys KeyGenerator::create_relin_keys_with_sk_round_one(std::size_t count, bool save_seed, SecretKey &sk) 
+    {
+        // Check to see if secret key and public key have been generated
+        if (!sk_generated_)
+        {
+            throw logic_error("cannot generate relinearization keys for unspecified secret key");
+        }
+        if (!count || count > SEAL_CIPHERTEXT_SIZE_MAX - 2)
+        {
+            throw invalid_argument("invalid count");
+        }
+
+        // Extract encryption parameters.
+        auto &context_data = *context_.key_context_data();
+        auto &parms = context_data.parms();
+        size_t coeff_count = parms.poly_modulus_degree();
+        size_t coeff_modulus_size = parms.coeff_modulus().size();
+
+        // Size check
+        if (!product_fits_in(coeff_count, coeff_modulus_size))
+        {
+            throw logic_error("invalid parameters");
+        }
+
+        // Make sure we have enough secret keys computed
+        compute_secret_key_array(context_data, count + 1);
+
+        // Create the RelinKeys object to return
+        RelinKeys relin_keys;
+
+        // Assume the secret key is already transformed into NTT form.
+        ConstPolyIter secret_key(secret_key_array_.get(), coeff_count, coeff_modulus_size);
+
+        generate_kswitch_keys_round_one(secret_key, count, static_cast<KSwitchKeys &>(relin_keys), save_seed);
+
+        // Set the parms_id
+        relin_keys.parms_id() = context_data.parms_id();
+
+        return relin_keys;
+    }
+
+    void KeyGenerator::aggregate_relin_keys_round_one(std::vector<RelinKeys> &relinKeys, int party_num, RelinKeys &destination) 
+    {
+        // Extract encryption parameters.
+        auto &context_data = *context_.key_context_data();
+        auto &parms = context_data.parms();
+        auto &coeff_modulus = parms.coeff_modulus();
+        size_t coeff_count = parms.poly_modulus_degree();
+        size_t coeff_modulus_size = coeff_modulus.size();
+        size_t encrypted_size = 2;
+        // Size check
+        if (!product_fits_in(coeff_count, coeff_modulus_size))
+        {
+            throw logic_error("invalid parameters");
+        }
+
+        if (relinKeys[0].data().empty()) {
+            throw logic_error("relinKeys is empty");
+        }
+
+        int count = relinKeys[0].data().size();
+        destination.data().resize(count);
+
+        destination.data() = relinKeys[0].data();
+        for (int j = 1; j < party_num; ++j) 
+        {
+            SEAL_ITERATE(iter(relinKeys[j].data(),destination.data()), count, [&](auto I) {
+                this->aggregate_round_one_relin_key_share(get<0>(I), get<1>(I));
+            });
+        }
+
+    }
+
+    void KeyGenerator::aggregate_round_one_relin_key_share(std::vector<PublicKey> &relinKey, std::vector<PublicKey> &destination) 
+    {
+        size_t coeff_count = context_.key_context_data()->parms().poly_modulus_degree();
+        size_t decomp_mod_count = context_.first_context_data()->parms().coeff_modulus().size();
+        auto &key_context_data = *context_.key_context_data();
+        auto &key_parms = key_context_data.parms();
+        auto &key_modulus = key_parms.coeff_modulus();
+        size_t coeff_modulus_size = key_modulus.size();
+
+        // Size check
+        if (!product_fits_in(coeff_count, decomp_mod_count))
+        {
+            throw logic_error("invalid parameters");
+        }
+
+        // KSwitchKeys data allocated from pool given by MemoryManager::GetPool.
+        destination.resize(decomp_mod_count);
+
+        for (int i = 0; i <decomp_mod_count ; i++){
+            for (size_t j = 0; j < coeff_modulus_size; j++){
+                // sample_poly_uniform(ciphertext_prng, key_parms, destination[i].data().data(1)+ j * coeff_count);
+                add_poly_coeffmod(destination[i].data().data()+ j * coeff_count,relinKey[i].data().data() + j * coeff_count , coeff_count, key_modulus[j],destination[i].data().data()+ j * coeff_count);
+            }
+        }
+    }
+
+    RelinKeys KeyGenerator::create_relin_keys_with_sk_round_two(std::size_t count, bool save_seed, RelinKeys &round_one)
+    {
+        // Check to see if secret key and public key have been generated
+        if (!sk_generated_)
+        {
+            throw logic_error("cannot generate relinearization keys for unspecified secret key");
+        }
+        if (!count || count > SEAL_CIPHERTEXT_SIZE_MAX - 2)
+        {
+            throw invalid_argument("invalid count");
+        }
+
+        // Extract encryption parameters.
+        auto &context_data = *context_.key_context_data();
+        auto &parms = context_data.parms();
+        size_t coeff_count = parms.poly_modulus_degree();
+        size_t coeff_modulus_size = parms.coeff_modulus().size();
+
+        // Size check
+        if (!product_fits_in(coeff_count, coeff_modulus_size))
+        {
+            throw logic_error("invalid parameters");
+        }
+
+        // Make sure we have enough secret keys computed
+        compute_secret_key_array(context_data, count + 1);
+
+        // Create the RelinKeys object to return
+        RelinKeys relin_keys;
+
+        // Assume the secret key is already transformed into NTT form.
+        ConstPolyIter secret_key(secret_key_array_.get(), coeff_count, coeff_modulus_size);
+
+        relin_keys.data() = round_one.data();
+
+        generate_kswitch_keys_round_two(secret_key, count, static_cast<KSwitchKeys &>(relin_keys), save_seed);
+
+        // Set the parms_id
+        relin_keys.parms_id() = context_data.parms_id();
+
+        return relin_keys;
+    }
+
+    RelinKeys KeyGenerator::create_comm_relin_keys(std::size_t count, std::vector<RelinKeys> &relinKeys, RelinKeys &round_one, int party_num, bool save_seed) 
+    {
+        // Check to see if secret key and public key have been generated
+        if (!sk_generated_)
+        {
+            throw logic_error("cannot generate relinearization keys for unspecified secret key");
+        }
+        if (!count || count > SEAL_CIPHERTEXT_SIZE_MAX - 2)
+        {
+            throw invalid_argument("invalid count");
+        }
+
+        // Extract encryption parameters.
+        auto &context_data = *context_.key_context_data();
+        auto &parms = context_data.parms();
+        size_t coeff_count = parms.poly_modulus_degree();
+        size_t coeff_modulus_size = parms.coeff_modulus().size();
+
+        // Size check
+        if (!product_fits_in(coeff_count, coeff_modulus_size))
+        {
+            throw logic_error("invalid parameters");
+        }
+
+        
+        RelinKeys cRelinKeys;
+
+        RelinKeys round_two;
+        round_two.data().resize(count);
+
+        round_two.data() = relinKeys[0].data();
+
+        for (int j = 1; j < party_num; ++j) 
+        {
+            SEAL_ITERATE(iter(relinKeys[j].data(),round_two.data()), count, [&](auto I) {
+                this->aggregate_round_one_relin_key_share(get<0>(I), get<1>(I));
+            });
+        }
+
+        generate_kswitch_keys_round_one_two(count, static_cast<KSwitchKeys &>(cRelinKeys), 
+            static_cast<KSwitchKeys &>(round_one), static_cast<KSwitchKeys &>(round_two), save_seed);
+
+        cRelinKeys.parms_id() = context_data.parms_id();
+
+        return cRelinKeys;
+    }
+
+    void KeyGenerator::generate_kswitch_keys_round_one_two(
+        size_t num_keys, KSwitchKeys &destination, KSwitchKeys &round_one, KSwitchKeys &round_two, bool save_seed)
+    {
+        size_t coeff_count = context_.key_context_data()->parms().poly_modulus_degree();
+        auto &key_context_data = *context_.key_context_data();
+        auto &key_parms = key_context_data.parms();
+        size_t coeff_modulus_size = key_parms.coeff_modulus().size();
+
+        // Size check
+        if (!product_fits_in(coeff_count, coeff_modulus_size, num_keys))
+        {
+            throw logic_error("invalid parameters");
+        }
+
+        destination.data().resize(num_keys);
+        SEAL_ITERATE(iter(destination.data(), round_one.data(), round_two.data()), num_keys, [&](auto I) {
+            this->aggregate_comm_relin_key_share(get<2>(I), get<1>(I), save_seed, get<0>(I));
+        });
+    }
+
+    void KeyGenerator::aggregate_comm_relin_key_share(std::vector<PublicKey> &round_two, std::vector<PublicKey> &round_one, bool save_seed, std::vector<PublicKey> &destination) 
+    {
+        size_t coeff_count = context_.key_context_data()->parms().poly_modulus_degree();
+        size_t decomp_mod_count = context_.first_context_data()->parms().coeff_modulus().size();
+        auto &key_context_data = *context_.key_context_data();
+        auto &key_parms = key_context_data.parms();
+        auto &key_modulus = key_parms.coeff_modulus();
+        size_t coeff_modulus_size = key_modulus.size();
+
+        // Size check
+        if (!product_fits_in(coeff_count, decomp_mod_count))
+        {
+            throw logic_error("invalid parameters");
+        }
+
+        // KSwitchKeys data allocated from pool given by MemoryManager::GetPool.
+        destination.resize(decomp_mod_count);
+   
+        SEAL_ITERATE(iter(round_one, key_modulus, destination, size_t(0), round_two), decomp_mod_count, [&](auto I) {
+            SEAL_ALLOCATE_GET_COEFF_ITER(temp, coeff_count, pool_);
+            encrypt_zero_symmetric_with_round_one_two(
+                get<0>(I).data(), context_, key_context_data.parms_id(), true, save_seed,get<4>(I).data(), get<2>(I).data());
+
+        });
+
+    }
+
 } // namespace seal
